@@ -101,7 +101,7 @@ downloaded data otherwise."
 (defun devdocs--doc-title (doc)
   "Title of document with slug DOC."
   (let-alist (devdocs--doc-metadata doc)
-    (if .version (concat .name " " .version) .name)))
+    (if (seq-empty-p .version) .name (concat .name " " .version))))
 
 (defun devdocs--read-document (prompt &optional predicate multiple refresh)
   "Query interactively for a DevDocs document.
@@ -199,21 +199,18 @@ This is an alist containing `entries' and `types'."
 
 (define-derived-mode devdocs-mode special-mode "DevDocs"
   "Major mode for viewing DevDocs documents."
-  (setq-local browse-url-browser-function
-              (cons '("\\`[^:]*\\'" . devdocs--browse-url)
-                    (if (functionp browse-url-browser-function)
-                        `(("." . ,browse-url-browser-function))
-                      browse-url-browser-function)))
-  (setq buffer-undo-list t
-        header-line-format devdocs-header-line
-        truncate-lines t))
+  (setq-local
+   browse-url-browser-function 'devdocs--browse-url
+   buffer-undo-list t
+   header-line-format devdocs-header-line
+   truncate-lines t))
 
 (defun devdocs-goto-target ()
   "Go to the original position in a DevDocs buffer."
   (interactive)
   (goto-char (point-min))
-  (text-property-search-forward 'shr-target-id)
-  (beginning-of-line))
+  (when-let ((match (text-property-search-forward 'shr-target-id shr-target-id t)))
+    (goto-char (prop-match-beginning match))))
 
 (defun devdocs-go-back ()
   "Go to the previously displayed entry in this DevDocs buffer."
@@ -230,9 +227,30 @@ This is an alist containing `entries' and `types'."
     (user-error "No next entry"))
   (devdocs--render (pop devdocs--forward-stack)))
 
+(defun devdocs-next-entry (count)
+  "Go forward COUNT entries in this document.
+
+Note that this refers to the index order, which may not coincide
+with the order of appearance in the text."
+  (interactive "p")
+  (let-alist (car devdocs--stack)
+    (devdocs--render
+     (or (ignore-error 'args-out-of-range
+           (seq-elt (alist-get 'entries (devdocs--index .doc))
+                    (+ count .index)))
+         (user-error (if (< count 0) "No previous entry" "No next entry"))))))
+
+(defun devdocs-previous-entry (count)
+  "Go backward COUNT entries in this document."
+  (interactive "p")
+  (devdocs-next-entry (- count)))
+
 (let ((map devdocs-mode-map))
   (define-key map [tab] 'forward-button)
   (define-key map [backtab] 'backward-button)
+  (define-key map "g" 'devdocs-lookup)
+  (define-key map "p" 'devdocs-previous-entry)
+  (define-key map "n" 'devdocs-next-entry)
   (define-key map "l" 'devdocs-go-back)
   (define-key map "r" 'devdocs-go-forward)
   (define-key map "." 'devdocs-goto-target))
@@ -267,12 +285,12 @@ fragment part of ENTRY.path."
     (unless (eq major-mode 'devdocs-mode)
       (devdocs-mode))
     (let-alist entry
-      (let ((shr-target-id (or .fragment (devdocs--path-fragment .path)))
-            (buffer-read-only nil)
+      (let ((buffer-read-only nil)
             (file (expand-file-name (format "%s/%s.html" .doc (url-hexify-string
                                                                (devdocs--path-file .path)))
                                     devdocs-data-dir)))
         (erase-buffer)
+        (setq-local shr-target-id (or .fragment (devdocs--path-fragment .path)))
         ;; TODO: cl-progv here for shr settings?
         (shr-insert-document
          (with-temp-buffer
@@ -284,22 +302,25 @@ fragment part of ENTRY.path."
       (devdocs-goto-target)
       (current-buffer))))
 
-(defun devdocs--browse-url (url &rest _)
+(defun devdocs--browse-url (url &rest args)
   "A suitable `browse-url-browser-function' for `devdocs-mode'.
 URL can be an internal link in a DevDocs document."
-  (let-alist (car devdocs--stack)
-    (let* ((dest (devdocs--path-expand url .path))
-           (file (devdocs--path-file dest))
-           (frag (devdocs--path-fragment dest))
-           (entry (seq-some (lambda (it)
-                              (when (let-alist it
-                                      (or (string= .path dest)
-                                          (string= .path file)))
-                                it))
-                            (alist-get 'entries (devdocs--index .doc)))))
-      (unless entry (error "Can't find `%s'" dest))
-      (when frag (push `(fragment . ,frag) entry))
-      (devdocs--render entry))))
+  (if (string-match-p ":" url)
+      (let ((browse-url-browser-function (default-value 'browse-url-browser-function)))
+        (apply #'browse-url url args))
+    (let-alist (car devdocs--stack)
+      (let* ((dest (devdocs--path-expand url .path))
+             (file (devdocs--path-file dest))
+             (frag (devdocs--path-fragment dest))
+             (entry (seq-some (lambda (it)
+                                (when (let-alist it
+                                        (or (string= .path dest)
+                                            (string= .path file)))
+                                  it))
+                              (alist-get 'entries (devdocs--index .doc)))))
+        (unless entry (error "Can't find `%s'" dest))
+        (when frag (push `(fragment . ,frag) entry))
+        (devdocs--render entry)))))
 
 ;;; Lookup command
 
@@ -329,7 +350,9 @@ URL can be an internal link in a DevDocs document."
          (max (point-max)))
     (while (and (< pos max) (/= 0 (char-after pos)))
       (setq pos (1+ pos)))
-    (add-text-properties pos max '(invisible t rear-nonsticky t cursor-intangible t))))
+    (when (< pos max)
+      (add-text-properties pos (next-property-change pos nil max)
+                           '(invisible t rear-nonsticky t)))))
 
 (defun devdocs--read-entry (prompt)
   "Read the name of an entry in a document, using PROMPT.
