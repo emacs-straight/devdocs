@@ -4,7 +4,7 @@
 
 ;; Author: Augusto Stoffel <arstoffel@gmail.com>
 ;; Keywords: help
-;; URL: https://github.com/astoff/devdocs
+;; URL: https://github.com/astoff/devdocs.el
 ;; Package-Requires: ((emacs "27.1"))
 ;; Version: 0.1
 
@@ -41,6 +41,9 @@
 (eval-when-compile
   (require 'let-alist))
 
+(unless (libxml-available-p)
+  (display-warning 'devdocs "This package requires Emacs to be compiled with libxml2"))
+
 (defgroup devdocs nil
   "Emacs viewer for DevDocs."
   :group 'help
@@ -69,12 +72,32 @@
   "String used to format a documentation location, e.g. in header line."
   :type 'string)
 
-(defvar devdocs--index (make-hash-table :test 'equal)
-  "A hash table to cache document indices.
-To be accessed through the function `devdocs--index'.")
+(defcustom devdocs-fontify-code-blocks t
+  "Whether to fontify code snippets inside pre tags.
+Fontification is done using the `org-src' library, which see."
+  :type 'boolean)
 
 (defvar devdocs-history nil
   "History of documentation entries.")
+
+;;; Memoization
+
+(defvar devdocs--cache (make-hash-table :test 'equal)
+  "Hash table used by `devdocs--with-cache'.")
+
+(defmacro devdocs--with-cache (&rest body)
+  "Evaluate BODY with memoization.
+The return value is stored and reused if needed again within the
+time span specified by `devdocs-timeout'."
+  `(if-let ((fun (lambda () ,@body))
+            (data (gethash fun devdocs--cache)))
+       (prog1 (cdr data)
+         (timer-set-time (car data) devdocs-timeout))
+     (let ((val (funcall fun))
+           (timer (run-at-time devdocs-timeout nil
+                               (lambda () (remhash fun devdocs--cache)))))
+       (prog1 val
+         (puthash fun (cons timer val) devdocs--cache)))))
 
 ;;; Documentation management
 
@@ -90,10 +113,11 @@ downloaded data otherwise."
   (when (or refresh (hash-table-empty-p devdocs--doc-metadata))
     (let* ((file (expand-file-name "docs.json" devdocs-data-dir))
            (docs (if (or refresh (not (file-exists-p file)))
-                     (with-temp-file file
-                       (make-directory (file-name-directory file) t)
-                       (url-insert-file-contents (format "%s/docs.json" devdocs-site-url))
-                       (json-read))
+                     (devdocs--with-cache
+                      (with-temp-file file
+                        (make-directory (file-name-directory file) t)
+                        (url-insert-file-contents (format "%s/docs.json" devdocs-site-url))
+                        (json-read)))
                    (json-read-file file))))
       (clrhash devdocs--doc-metadata)
       (seq-doseq (doc docs)
@@ -160,7 +184,7 @@ DOC is a document slug."
     (with-temp-file (expand-file-name "metadata" temp)
       (prin1 (devdocs--doc-metadata doc) (current-buffer)))
     (rename-file temp (expand-file-name doc devdocs-data-dir) t)
-    (clrhash devdocs--index)
+    (clrhash devdocs--cache)
     (message "Installed %s documentation" (devdocs--doc-title doc))))
 
 ;;; Document indexes
@@ -168,22 +192,17 @@ DOC is a document slug."
 (defun devdocs--index (doc)
   "Return the index of document DOC.
 This is an alist containing `entries' and `types'."
-  (if-let ((idx (gethash doc devdocs--index)))
-      (prog1 idx
-        (timer-set-time (alist-get 'timer idx) devdocs-timeout))
-    (let* ((docid (cons 'doc doc))
-           (idx (json-read-file (expand-file-name (concat doc "/index.json")
-                                                  devdocs-data-dir)))
-           (entries (alist-get 'entries idx)))
-      (setf (alist-get 'timer idx)
-            (run-at-time devdocs-timeout nil
-                         (lambda () (remhash doc devdocs--index))))
-      (seq-do-indexed (lambda (entry i)
-                        (push `(index . ,i) entry)
-                        (push docid entry)
-                        (aset entries i entry))
-                      entries)
-      (puthash doc idx devdocs--index))))
+  (devdocs--with-cache
+   (let* ((docid (cons 'doc doc))
+          (idx (json-read-file (expand-file-name (concat doc "/index.json")
+                                                 devdocs-data-dir)))
+          (entries (alist-get 'entries idx)))
+     (prog1 idx
+       (seq-do-indexed (lambda (entry i)
+                         (push `(index . ,i) entry)
+                         (push docid entry)
+                         (aset entries i entry))
+                       entries)))))
 
 ;;; Documentation viewer
 
@@ -282,7 +301,8 @@ with the order of appearance in the text."
   "Insert and fontify pre-tag represented by DOM."
   (let ((start (point)))
     (shr-tag-pre dom)
-    (when-let ((lang (dom-attr dom 'data-language)))
+    (when-let ((lang (and devdocs-fontify-code-blocks
+                          (dom-attr dom 'data-language))))
       (org-src-font-lock-fontify-block (downcase lang) start (point)))))
 
 (defun devdocs--render (entry)
@@ -291,8 +311,6 @@ with the order of appearance in the text."
 ENTRY is an alist like those in the variable `devdocs--index',
 possibly with an additional ENTRY.fragment which overrides the
 fragment part of ENTRY.path."
-  (or (libxml-available-p)
-      (error "This function requires Emacs to be compiled with libxml2"))
   (with-current-buffer (get-buffer-create "*devdocs*")
     (unless (eq major-mode 'devdocs-mode)
       (devdocs-mode))
