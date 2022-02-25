@@ -246,22 +246,20 @@ DOC is a document metadata alist."
 
 ;;; Document indexes
 
-(defun devdocs--index (doc)
-  "Return the index of document DOC.
-This is an alist containing `entries', `pages' and `types'."
-  (let* ((docid (cons 'doc doc))
-         (idx (with-temp-buffer
-                (insert-file-contents (expand-file-name
-                                       (concat (alist-get 'slug doc) "/index")
-                                       devdocs-data-dir))
-                (read (current-buffer))))
-         (entries (alist-get 'entries idx)))
-    (prog1 idx
-      (seq-do-indexed (lambda (entry i)
-                        (push docid entry)
-                        (push `(index . ,i) entry)
-                        (aset entries i entry))
-                      entries))))
+(defun devdocs--index (doc kind)
+  "Return an index of document DOC, where KIND is `entries', `pages' or `types'."
+  (if kind
+      (alist-get kind (devdocs--with-cache (devdocs--index doc nil)))
+    (let* ((docmeta (cons 'doc doc))
+           (indexes (with-temp-buffer
+                      (insert-file-contents (expand-file-name
+                                             (concat (alist-get 'slug doc) "/index")
+                                             devdocs-data-dir))
+                      (read (current-buffer))))
+           (entries (alist-get 'entries indexes)))
+      (prog1 indexes
+        (seq-do-indexed (lambda (entry i) (aset entries i (cons docmeta entry)))
+                        entries)))))
 
 ;;; Documentation viewer
 
@@ -275,7 +273,7 @@ This is an alist containing `entries', `pages' and `types'."
   '(:eval (let-alist (car devdocs--stack)
             (concat (devdocs--doc-title .doc)
                     (and .type devdocs-separator) .type
-                    (and .name devdocs-separator) .name))))
+                    devdocs-separator (or .name .path)))))
 
 (define-derived-mode devdocs-mode special-mode "DevDocs"
   "Major mode for viewing DevDocs documents."
@@ -316,30 +314,52 @@ Note that this refers to the index order, which may not coincide
 with the order of appearance in the text."
   (interactive "p")
   (let-alist (car devdocs--stack)
-    (unless .index
-      (user-error "No current entry"))
-    (devdocs--render
-     (or (ignore-error 'args-out-of-range
-           (elt (alist-get 'entries (devdocs--index .doc))
-                (+ count .index)))
-         (user-error (if (< count 0) "No previous entry" "No next entry"))))))
+    (let* ((entries (devdocs--index .doc 'entries))
+           (pred (lambda (entry _) (string= (alist-get 'path entry) .path)))
+           (current (seq-position entries nil pred)))
+      (unless current (user-error "No current entry"))
+      (devdocs--render
+       (or (ignore-error 'args-out-of-range (elt entries (+ count current)))
+           (user-error "No %s entry" (if (< count 0) "previous" "next")))))))
 
 (defun devdocs-previous-entry (count)
   "Go backward COUNT entries in this document."
   (interactive "p")
   (devdocs-next-entry (- count)))
 
+(defun devdocs-goto-page (doc page)
+  "Go to a given PAGE (a number or path) of DOC.
+Interactively, read a page name with completion."
+  (interactive (let-alist (car devdocs--stack)
+                 (list .doc (completing-read "Go to page: "
+                                             (append (devdocs--index .doc 'pages) nil)
+                                             nil t nil 'devdocs-history))))
+  (let* ((path (cond ((stringp page) page)
+                     ((numberp page) (elt (devdocs--index doc 'pages) page))))
+         (entry (or (seq-find (lambda (entry) (string= (alist-get 'path entry) path))
+                              (devdocs--index doc 'entries))
+                    `((doc . ,doc) (path . ,path)))))
+    (devdocs--render entry)))
+
+(defun devdocs-first-page (doc)
+  "Go to first page of DOC."
+  (interactive (list (alist-get 'doc (car devdocs--stack))))
+  (devdocs-goto-page doc 0))
+
+(defun devdocs-last-page (doc)
+  "Go to last page of DOC."
+  (interactive (list (alist-get 'doc (car devdocs--stack))))
+  (devdocs-goto-page doc (1- (length (devdocs--index doc 'pages)))))
+
 (defun devdocs-next-page (count)
   "Go forward COUNT pages in this document."
   (interactive "p")
   (let-alist (car devdocs--stack)
-    (let* ((pages (alist-get 'pages (devdocs--index .doc)))
-           (page (+ count (seq-position pages (devdocs--path-file .path))))
-           (path (or (ignore-error 'args-out-of-range (elt pages page))
-                     (user-error (if (< count 0) "No previous page" "No next page")))))
-      (devdocs--render `((doc . ,.doc)
-                         (path . ,path)
-                         (name . ,(format "%s/%s" (1+ page) (length pages))))))))
+    (let* ((pages (devdocs--index .doc 'pages))
+           (dest (+ count (seq-position pages (devdocs--path-file .path)))))
+      (cond ((< dest 0) (user-error "No previous page"))
+            ((<= (length pages) dest) (user-error "No next page")))
+      (devdocs-goto-page .doc dest))))
 
 (defun devdocs-previous-page (count)
   "Go backward COUNT entries in this document."
@@ -362,17 +382,21 @@ with the order of appearance in the text."
       (message "Copied %s" url))))
 
 (let ((map devdocs-mode-map))
-  (define-key map [tab] 'forward-button)
-  (define-key map [backtab] 'backward-button)
-  (define-key map "i" 'devdocs-lookup)
-  (define-key map "p" 'devdocs-previous-entry)
-  (define-key map "n" 'devdocs-next-entry)
-  (define-key map "[" 'devdocs-previous-page)
-  (define-key map "]" 'devdocs-next-page)
-  (define-key map "l" 'devdocs-go-back)
-  (define-key map "r" 'devdocs-go-forward)
-  (define-key map "w" 'devdocs-copy-url)
-  (define-key map "." 'devdocs-goto-target))
+  (define-key map [tab] #'forward-button)
+  (define-key map [backtab] #'backward-button)
+  (define-key map "d" #'devdocs-peruse)
+  (define-key map "i" #'devdocs-lookup)
+  (define-key map "p" #'devdocs-previous-entry)
+  (define-key map "n" #'devdocs-next-entry)
+  (define-key map "g" #'devdocs-goto-page)
+  (define-key map "[" #'devdocs-previous-page)
+  (define-key map "]" #'devdocs-next-page)
+  (define-key map "<" #'devdocs-first-page)
+  (define-key map ">" #'devdocs-last-page)
+  (define-key map "l" #'devdocs-go-back)
+  (define-key map "r" #'devdocs-go-forward)
+  (define-key map "w" #'devdocs-copy-url)
+  (define-key map "." #'devdocs-goto-target))
 
 ;;; Rendering
 
@@ -390,10 +414,9 @@ with the order of appearance in the text."
   (pcase (string-to-char path)
     ('?/ path)
     ('?# (concat (devdocs--path-file base) path))
-    (_ (substring ;; ugly!
+    (_ (seq-rest ;; drop leading slash
         (url-expander-remove-relative-links ;; undocumented function!
-         (concat (file-name-directory base) path))
-        1))))
+         (concat (file-name-directory base) path))))))
 
 (defun devdocs--shr-tag-pre (dom)
   "Insert and fontify pre-tag represented by DOM."
@@ -406,7 +429,7 @@ with the order of appearance in the text."
 (defun devdocs--render (entry)
   "Render a DevDocs documentation entry, returning a buffer.
 
-ENTRY is an alist like those in the variable `devdocs--index',
+ENTRY is an alist like those in the entry index of the document,
 possibly with an additional ENTRY.fragment which overrides the
 fragment part of ENTRY.path."
   (with-current-buffer (get-buffer-create "*devdocs*")
@@ -448,14 +471,12 @@ ARGS is passed as is to `browse-url'."
       (let* ((dest (devdocs--path-expand url .path))
              (file (devdocs--path-file dest))
              (frag (devdocs--path-fragment dest))
-             (entry (seq-some (lambda (it)
-                                (when (let-alist it
-                                        (or (string= .path dest)
-                                            (string= .path file)))
-                                  it))
-                              (alist-get 'entries (devdocs--index .doc)))))
+             (entry (seq-find (lambda (it)
+                                (let-alist it
+                                  (or (string= .path dest)
+                                      (string= .path file))))
+                              (devdocs--index .doc 'entries))))
         (unless entry (error "Can't find `%s'" dest))
-        (push `(doc . ,.doc) entry)
         (when frag (push `(fragment . ,frag) entry))
         (devdocs--render entry)))))
 
@@ -471,7 +492,7 @@ ARGS is passed as is to `browse-url'."
                       `(,name ,count . ,it))))
          (entries (mapcan (lambda (doc)
                             (mapcar mkentry
-                                    (alist-get 'entries (devdocs--index doc))))
+                                    (devdocs--index doc 'entries)))
                           documents)))
     (mapcar (pcase-lambda (`(,name ,count . ,it))
               (propertize (if (= 1 (gethash name counts))
@@ -492,8 +513,8 @@ ARGS is passed as is to `browse-url'."
 
 (defun devdocs--relevant-docs (ask)
   "Return a list of relevant documents for the current buffer.
-May ask interactively for the desired documents.  If ASK is
-non-nil, ask unconditionally."
+May ask interactively for the desired documents, remembering the
+choice for this buffer.  If ASK is non-nil, ask unconditionally."
   (if ask
       (let ((docs (devdocs--read-document "Documents for this buffer: " t)))
         (prog1 docs
@@ -544,11 +565,7 @@ If INITIAL-INPUT is not nil, insert it into the minibuffer."
 (defun devdocs-peruse (doc)
   "Read a document from the first page."
   (interactive (list (devdocs--read-document "Peruse documentation: ")))
-  (let ((pages (alist-get 'pages (devdocs--index doc))))
-    (pop-to-buffer
-     (devdocs--render `((path . ,(seq-first pages))
-                        (doc . ,doc)
-                        (name . ,(format "%s/%s" 1 (length pages))))))))
+  (pop-to-buffer (devdocs-goto-page doc 0)))
 
 ;;; Compatibility with the old devdocs package
 
