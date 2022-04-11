@@ -279,6 +279,7 @@ DOC is a document metadata alist."
 
 (define-derived-mode devdocs-mode special-mode "DevDocs"
   "Major mode for viewing DevDocs documents."
+  :interactive nil
   (setq-local
    browse-url-browser-function 'devdocs--browse-url
    buffer-undo-list t
@@ -467,6 +468,7 @@ fragment part of ENTRY.path."
       (set-buffer-modified-p nil)
       (setq-local devdocs-current-docs (list .doc.slug))
       (push entry devdocs--stack)
+      (setq-local list-buffers-directory (format-mode-line devdocs-header-line nil nil (current-buffer)))
       (devdocs-goto-target)
       (current-buffer))))
 
