@@ -38,7 +38,8 @@
 (require 'shr)
 (require 'url-expand)
 (eval-when-compile
-  (require 'let-alist))
+  (require 'let-alist)
+  (require 'subr-x))
 
 (unless (libxml-available-p)
   (display-warning 'devdocs "This package requires Emacs to be compiled with libxml2"))
@@ -129,6 +130,12 @@ its return value; take the necessary precautions."
 
 ;;; Documentation management
 
+(defalias 'devdocs--json-parse-buffer
+  (if (json-available-p)
+      (lambda () (json-parse-buffer :object-type 'alist))
+    (require 'json)
+    #'json-read))
+
 (defun devdocs--doc-metadata (slug)
   "Return the metadata of an installed document named SLUG."
   (let ((file (expand-file-name (concat slug "/metadata") devdocs-data-dir)))
@@ -156,7 +163,7 @@ If necessary, download data from `devdocs-site-url'."
    (with-temp-buffer
      (url-insert-file-contents
       (format "%s/docs.json" devdocs-site-url))
-     (json-read))))
+     (devdocs--json-parse-buffer))))
 
 (defun devdocs--doc-title (doc)
   "Title of document DOC.
@@ -199,9 +206,14 @@ DOC is a document metadata alist."
 ;;;###autoload
 (defun devdocs-install (doc)
   "Download and install DevDocs documentation.
-DOC is a document metadata alist."
+DOC is a document slug or metadata alist.  If the document is
+already installed, reinstall it."
   (interactive (list (devdocs--read-document "Install documentation: " nil t)))
   (make-directory devdocs-data-dir t)
+  (unless (listp doc)
+    (setq doc (or (seq-find (lambda (it) (string= doc (alist-get 'slug it)))
+                            (devdocs--available-docs))
+                  (user-error "No such document: %s" doc))))
   (let* ((slug (alist-get 'slug doc))
          (mtime (alist-get 'mtime doc))
          (temp (make-temp-file "devdocs-" t))
@@ -209,16 +221,15 @@ DOC is a document metadata alist."
     (with-temp-buffer
       (url-insert-file-contents (format "%s/%s/db.json?%s" devdocs-cdn-url slug mtime))
       (dolist-with-progress-reporter
-          (entry (let ((json-key-type 'string))
-                   (json-read)))
+          (entry (devdocs--json-parse-buffer))
           "Installing documentation..."
         (with-temp-file (expand-file-name
                          (url-hexify-string (format "%s.html" (car entry))) temp)
-          (push (car entry) pages)
+          (push (symbol-name (car entry)) pages)
           (insert (cdr entry)))))
     (with-temp-buffer
       (url-insert-file-contents (format "%s/%s/index.json?%s" devdocs-cdn-url slug mtime))
-      (let ((index (json-read)))
+      (let ((index (devdocs--json-parse-buffer)))
         (push `(pages . ,(vconcat (nreverse pages))) index)
         (with-temp-file (expand-file-name "index" temp)
           (prin1 index (current-buffer)))))
@@ -336,7 +347,7 @@ with the order of appearance in the text."
            (current (seq-position entries nil pred)))
       (unless current (user-error "No current entry"))
       (devdocs--render
-       (or (ignore-error 'args-out-of-range (elt entries (+ count current)))
+       (or (ignore-error args-out-of-range (elt entries (+ count current)))
            (user-error "No %s entry" (if (< count 0) "previous" "next")))))))
 
 (defun devdocs-previous-entry (count)
@@ -431,7 +442,8 @@ Interactively, read a page name with completion."
   (pcase (string-to-char path)
     ('?/ path)
     ('?# (concat (devdocs--path-file base) path))
-    (_ (seq-rest ;; drop leading slash
+    (_ (string-remove-prefix
+        "/"
         (url-expander-remove-relative-links ;; undocumented function!
          (concat (file-name-directory base) path))))))
 
