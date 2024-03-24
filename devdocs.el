@@ -1,12 +1,12 @@
 ;;; devdocs.el --- Emacs viewer for DevDocs -*- lexical-binding: t -*-
 
-;; Copyright (C) 2021  Free Software Foundation, Inc.
+;; Copyright (C) 2021-2024  Free Software Foundation, Inc.
 
 ;; Author: Augusto Stoffel <arstoffel@gmail.com>
 ;; Keywords: help
 ;; URL: https://github.com/astoff/devdocs.el
 ;; Package-Requires: ((emacs "27.1"))
-;; Version: 0.5
+;; Version: 0.6
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -82,7 +82,7 @@ name and a count."
   :type '(choice (const :tag "Count in parentheses, italicized"
                         #("%s (%s)" 3 7 (face italic)))
                  (const :tag "Invisible cookie"
-                        #("%s (%s)" 2 7 (invisible t)))
+                        #("%s#%s" 2 5 (invisible t)))
                  string))
 
 (defcustom devdocs-fontify-code-blocks t
@@ -316,7 +316,8 @@ already installed, reinstall it."
   "Go to the original position in a DevDocs buffer."
   (interactive)
   (goto-char (point-min))
-  (when-let ((pred (if (fboundp 'shr--set-target-ids) #'member t)) ;; shr change in Emacs 29
+  (when-let ((_ shr-target-id)
+             (pred (if (fboundp 'shr--set-target-ids) #'member t)) ;; shr change in Emacs 29
              (match (text-property-search-forward 'shr-target-id shr-target-id pred)))
     (goto-char (prop-match-beginning match))))
 
@@ -483,19 +484,22 @@ fragment part of ENTRY.path."
             (file (expand-file-name (format "%s/%s.html"
                                             .doc.slug
                                             (url-hexify-string (devdocs--path-file .path)))
-                                    devdocs-data-dir)))
+                                    devdocs-data-dir))
+            (shr-target-id (when-let ((frag (or .fragment (devdocs--path-fragment .path))))
+                             (url-unhex-string frag))))
         (erase-buffer)
-        (setq-local shr-target-id (url-unhex-string (or .fragment (devdocs--path-fragment .path))))
         ;; TODO: cl-progv here for shr settings?
         (shr-insert-document
          (with-temp-buffer
            (insert-file-contents file)
-           (libxml-parse-html-region (point-min) (point-max)))))
+           (libxml-parse-html-region (point-min) (point-max))))
+        (devdocs-goto-target))
       (set-buffer-modified-p nil)
       (setq-local devdocs-current-docs (list .doc.slug))
       (push entry devdocs--stack)
-      (setq-local list-buffers-directory (format-mode-line devdocs-header-line nil nil (current-buffer)))
-      (devdocs-goto-target)
+      (setq-local list-buffers-directory (format-mode-line devdocs-header-line
+                                                           nil nil
+                                                           (current-buffer)))
       (current-buffer))))
 
 (defun devdocs--revert-buffer (&rest _args)
